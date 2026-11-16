@@ -729,36 +729,43 @@ function tryLink(src, pos, refs, st, bounds) {
   }
 
   // --- full reference link: ][ref] ---
+  // A collapsed `[label][]` uses the label as its own ref. If the ref is
+  // not defined, fall through to the shortcut form instead of failing.
   if (src[after] === "[") {
     const sc2 = scanLabel(src, after);
-    if (!sc2) return null;
-    const ref = normLabel(sc2.label);
-    const def = refs[ref];
-    if (!def) return null;
-    const inner = deLink(unescLabel(label), isImage, st, refs);
-    if (inner === null) return null;
-    if (isImage) {
-      const alt = escHtml(inner.replace(/<[^>]*>/g, ""));
-      const t = def.title ? ' title="' + escHtml(def.title) + '"' : "";
-      return { html: '<img src="' + escHref(def.dest) + '" alt="' + alt + '"' + t + ">", next: sc2.end + 1 };
+    if (sc2) {
+      const ref = sc2.label === "" ? normLabel(label) : normLabel(sc2.label);
+      const def = refs[ref];
+      if (def) {
+        const inner = deLink(unescLabel(label), isImage, st, refs);
+        if (inner !== null) {
+          if (isImage) {
+            const alt = escHtml(inner.replace(/<[^>]*>/g, ""));
+            const t = def.title ? ' title="' + escHtml(def.title) + '"' : "";
+            return { html: '<img src="' + escHref(def.dest) + '" alt="' + alt + '"' + t + ">", next: sc2.end + 1 };
+          }
+          const t = def.title ? ' title="' + escHtml(def.title) + '"' : "";
+          return { html: '<a href="' + escHref(def.dest) + '"' + t + ">" + inner + "</a>", next: sc2.end + 1 };
+        }
+      }
     }
-    const t = def.title ? ' title="' + escHtml(def.title) + '"' : "";
-    return { html: '<a href="' + escHref(def.dest) + '"' + t + ">" + inner + "</a>", next: sc2.end + 1 };
   }
 
-  // --- shortcut reference link: [label] ---
+  // --- shortcut reference link: [label] (optionally followed by []) ---
   const ref = normLabel(label);
   const def = refs[ref];
   if (!def) return null;
   const inner = deLink(unescLabel(label), isImage, st, refs);
   if (inner === null) return null;
+  let next = after;
+  if (src[next] === "[" && src[next + 1] === "]") next += 2;
   if (isImage) {
     const alt = escHtml(inner.replace(/<[^>]*>/g, ""));
     const t = def.title ? ' title="' + escHtml(def.title) + '"' : "";
-    return { html: '<img src="' + escHref(def.dest) + '" alt="' + alt + '"' + t + ">", next: after };
+    return { html: '<img src="' + escHref(def.dest) + '" alt="' + alt + '"' + t + ">", next };
   }
   const t = def.title ? ' title="' + escHtml(def.title) + '"' : "";
-  return { html: '<a href="' + escHref(def.dest) + '"' + t + ">" + inner + "</a>", next: after };
+  return { html: '<a href="' + escHref(def.dest) + '"' + t + ">" + inner + "</a>", next };
 }
 
 // Code span: ^(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)
@@ -882,8 +889,13 @@ function inlineToHtml(src, refs, st, outer) {
     if (c === "`") {
       const cs = tryCodespan(src, i);
       if (cs) { parts.push(cs.html); i += cs.raw.length; prev = ""; continue; }
-      parts.push("`");
-      i++; prev = "`";
+      // A failed code span leaves the whole backtick run as literal text;
+      // do not retry at the next backtick of the same run (marked does not
+      // form a code span from one backtick of a longer run).
+      let k = i;
+      while (k < n && src[k] === "`") k++;
+      parts.push(src.slice(i, k));
+      i = k; prev = "`";
       continue;
     }
     if (c === "\\") {
@@ -1294,6 +1306,7 @@ function parseDoc(input) {
     // ---- Phase 1: match open containers ----
     let pos = 0;
     let failedAt = stack.length; // first depth that fails to match
+    let failedIsNewItem = false;
     for (let d = 1; d < stack.length; d++) {
       const c = stack[d];
       if (c.kind === "bq") {
@@ -1313,12 +1326,20 @@ function parseDoc(input) {
         if (parent && parent.kind === "list" && sp <= 3) {
           const lm = listMarker(line, pos + sp);
           if (lm && lm.ordered === parent.ordered && lm.marker === parent.marker && !lm.empty) {
+            failedIsNewItem = true;
             failedAt = d; break; // a new item of this list
           }
         }
         failedAt = d; break;
       }
       // list containers match trivially
+    }
+    // Close a failed container; if the failing container is a list item
+    // and the line is NOT a new item of its list, the list ends too.
+    function closeFailed() {
+      let depth = failedAt - 1;
+      if (failedAt < stack.length && stack[failedAt].kind === "item" && !failedIsNewItem) depth = failedAt - 2;
+      closeTo(depth);
     }
 
     // R2: fenced code block + a LIST ITEM failing to match -> the line is
@@ -1335,6 +1356,16 @@ function parseDoc(input) {
       return;
     }
 
+    // A line that is blank after the containers are stripped ends a
+    // paragraph (e.g. a lone `>` inside a blockquote) — it is not a lazy
+    // continuation. (Inside fenced/indented code or an HTML block it is
+    // content, so let phase2 handle it.)
+    if (isBlankStr(line.slice(pos)) && leaf && leaf.kind === "para") {
+      closeLeaf();
+      sawBlank = true;
+      return;
+    }
+
     // Lazy continuation of a paragraph.
     if (failedAt < stack.length && leaf && leaf.kind === "para" && !blank) {
       const restAfter = line.slice(pos);
@@ -1344,9 +1375,9 @@ function parseDoc(input) {
         leaf.lines.push(restAfter.slice(leadSpaces(restAfter)));
         return;
       }
-      closeTo(failedAt - 1);
+      closeFailed();
     } else if (failedAt < stack.length) {
-      closeTo(failedAt - 1);
+      closeFailed();
     }
 
     // A line that is blank after the containers are stripped is a blank
@@ -1437,9 +1468,10 @@ function parseDoc(input) {
             // Reuse the current list when it is the same kind/marker;
             // otherwise close it (the new list is a sibling, not a child).
             let list = null;
+            let listOnStack = false;
             if (curContainer().kind === "list") {
               const cur = curContainer();
-              if (cur.ordered === lm.ordered && cur.marker === lm.marker) list = cur;
+              if (cur.ordered === lm.ordered && cur.marker === lm.marker) { list = cur; listOnStack = true; }
               else stack.pop();
             }
             if (!list) {
@@ -1455,7 +1487,7 @@ function parseDoc(input) {
             item.precededByBlank = sawBlank;
             sawBlank = false;
             list.children.push(item);
-            stack.push(list);
+            if (!listOnStack) stack.push(list);
             stack.push(item);
             if (lm.empty) return;
             pos += indent + lm.contentIndent;
@@ -1545,7 +1577,7 @@ function renderNode(node, refs, st, out, tightPara) {
       const tag = node.ordered ? "ol" : "ul";
       const start = node.ordered && node.start !== 1 ? ' start="' + node.start + '"' : "";
       out.push("<" + tag + start + ">\n");
-      for (const item of node.children) renderItem(item, refs, st, out, loose);
+      for (const item of node.children) if (item.kind === "item") renderItem(item, refs, st, out, loose);
       out.push("</" + tag + ">\n");
       break;
     }
