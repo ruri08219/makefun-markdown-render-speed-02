@@ -1135,6 +1135,10 @@ function setextLevel(s, i) {
 function parseRefDef(s, i) {
   const n = s.length;
   let j = i;
+  // A link reference definition allows up to 3 leading spaces.
+  let sp = 0;
+  while (j < n && s[j] === " " && sp < 3) { j++; sp++; }
+  if (j < n && s[j] === " ") return null;
   if (s[j] !== "[") return null;
   const sc = scanLabel(s, j);
   if (!sc) return null;
@@ -1294,10 +1298,21 @@ function parseDoc(input) {
     processLine(line, blank);
   }
   closeLeaf();
-  // An HTML block gets a trailing newline only when its last line is the
-  // input's last line and the input ends with a newline.
+  // An HTML block's rendered text ends with a newline when the input has
+  // one after the block's last line. Types 2-5 (comment, processing
+  // instruction, declaration, CDATA) keep it unless the next line is
+  // completely empty. Types 1, 6 and 7 end at a blank line, so the
+  // newline belongs to the blank line and is only kept when the block is
+  // the last thing in the input and the input ends with one.
   (function markHtml(node) {
-    if (node.kind === "html" && node.lastLineIdx === lines.length - 1 && inputEndsNl) node.trailingNl = true;
+    if (node.kind === "html") {
+      if (node.htype >= 2 && node.htype <= 5) {
+        if (node.lastLineIdx < lines.length - 1) node.trailingNl = lines[node.lastLineIdx + 1].length > 0;
+        else node.trailingNl = inputEndsNl;
+      } else {
+        node.trailingNl = node.lastLineIdx === lines.length - 1 && inputEndsNl;
+      }
+    }
     for (const ch of node.children || []) markHtml(ch);
   })(root);
   return { doc: root, refs };
@@ -1634,8 +1649,25 @@ function renderNode(node, refs, st, out, tightPara) {
 
 function renderItem(item, refs, st, out, loose) {
   out.push("<li>");
-  for (const ch of item.children) {
+  for (let ci = 0; ci < item.children.length; ci++) {
+    const ch = item.children[ci];
     const tightPara = !loose && ch.kind === "para";
+    // GFM task list: a first paragraph starting with "[ ] ", "[x] " or
+    // "[X] " (with a space after ]) renders a checkbox at its start.
+    if (ci === 0 && ch.kind === "para") {
+      const t = ch.text;
+      let checked = -1;
+      if (t.startsWith("[ ] ")) checked = 0;
+      else if (t.startsWith("[x] ") || t.startsWith("[X] ")) checked = 1;
+      if (checked >= 0) {
+        const box = checked ? '<input checked="" disabled="" type="checkbox">' : '<input disabled="" type="checkbox">';
+        const rest = t.slice(4);
+        const html = inlineToHtml(rest, refs, st, "");
+        if (tightPara) out.push(box + " " + html);
+        else out.push("<p>" + box + " " + html + "</p>\n");
+        continue;
+      }
+    }
     renderNode(ch, refs, st, out, tightPara);
   }
   out.push("</li>\n");
