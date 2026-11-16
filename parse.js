@@ -66,34 +66,27 @@ function entityLenAt(s, i) {
   if (j < s.length && s[j] === ';') return j + 1 - i;
   return 0;
 }
+const ESC_RE = /&(#\d+;|#[xX][0-9a-fA-F]+;|[A-Za-z][A-Za-z0-9]*;)?|[<>"']/g;
 function esc(s) {
-  let out = '', last = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '&') {
-      const len = entityLenAt(s, i);
-      if (len > 0) { i += len - 1; continue; }
-      out += s.slice(last, i) + '&amp;'; last = i + 1;
-    } else {
-      const r = ESC_MAP[c];
-      if (r !== undefined) { out += s.slice(last, i) + r; last = i + 1; }
+  if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 && s.indexOf('"') < 0 && s.indexOf("'") < 0) return s;
+  return s.replace(ESC_RE, (m) => {
+    if (m.length === 1) return m === '&' ? '&amp;' : ESC_MAP[m];
+    // An entity-shaped match: a numeric reference above the valid
+    // range is not an entity (escaped like a bare &).
+    if (m[1] === '#') {
+      const hex = m[2] === 'x' || m[2] === 'X';
+      const code = parseInt(m.slice(hex ? 3 : 2, -1), hex ? 16 : 10);
+      if (code > 0x10FFFF) return '&amp;' + m.slice(1);
     }
-  }
-  return last === 0 ? s : out + s.slice(last);
+    return m;
+  });
 }
 // Escape for code content: `&` is always escaped (entities are not
 // recognised inside code spans or code blocks).
+const ESC_CODE_RE = /[&<>"']/g;
 function escCode(s) {
-  let out = '', last = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '&') { out += s.slice(last, i) + '&amp;'; last = i + 1; }
-    else if (c === '<') { out += s.slice(last, i) + '&lt;'; last = i + 1; }
-    else if (c === '>') { out += s.slice(last, i) + '&gt;'; last = i + 1; }
-    else if (c === '"') { out += s.slice(last, i) + '&quot;'; last = i + 1; }
-    else if (c === "'") { out += s.slice(last, i) + '&#39;'; last = i + 1; }
-  }
-  return last === 0 ? s : out + s.slice(last);
+  if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 && s.indexOf('"') < 0 && s.indexOf("'") < 0) return s;
+  return s.replace(ESC_CODE_RE, (m) => ESC_MAP[m]);
 }
 // Attribute / URL escaping: a & that starts a valid entity reference is
 // left alone (marked keeps &ouml; etc. verbatim in hrefs and titles).
@@ -436,7 +429,10 @@ function trimAutolinkUrl(u) {
     if (c === ';') {
       const m = /&[A-Za-z0-9#]+;$/.exec(u.slice(0, end));
       if (m) { end -= m[0].length; continue; }
-      break;
+      // A bare trailing ';' is stripped by marked's _backpedal (it is
+      // in the trailing-punctuation class); only a ';' that closes an
+      // entity reference is kept (handled above).
+      end--; continue;
     }
     if (c === ')' ) {
       let open = 0, close = 0;
@@ -445,19 +441,72 @@ function trimAutolinkUrl(u) {
       break;
     }
     if ('?.!,:\'"'.indexOf(c) >= 0 || c === ']' || c === '}') { end--; continue; }
+    // marked's _backpedal also strips a trailing run of * ~ _ ' "
+    // (e.g. www.mark.com** or www.down.com/output~~ must not swallow
+    // the emphasis/delimiter run that follows the URL).
+    if (c === '*' || c === '~' || c === '_' || c === "'" || c === '"') { end--; continue; }
     break;
   }
   return u.slice(0, end);
 }
-const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
+const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+(?![A-Za-z0-9_-])/;
+const EMAIL_RE_FULL = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
+// Match a bare email at s[i]. marked's email regex has a (?![\w-])
+// lookahead, so it backtracks to a shorter domain when the address is
+// followed by -/_/alnum (e.g. first@x.example.com- links only
+// first@x.example). Exception: when the address is followed by a `_`
+// run that can close an active `_` opener, marked re-tokenizes inside
+// the resulting <em> and links the whole address — so link it in full.
+function emailAt(s, i, delims) {
+  const full = EMAIL_RE_FULL.exec(s.slice(i));
+  if (full) {
+    const end = i + full[0].length;
+    if (s[end] === '_') {
+      let j = end;
+      while (j < s.length && s[j] === '_') j++;
+      const prev = s[end - 1], next = j < s.length ? s[j] : '';
+      const leftFlank = next !== '' && !isUnicodeWs(next) && (!isPunctChar(next) || prev === '' || isUnicodeWs(prev) || isPunctChar(prev));
+      const rightFlank = prev !== '' && !isUnicodeWs(prev) && (!isPunctChar(prev) || next === '' || isUnicodeWs(next) || isPunctChar(next));
+      const canClose = rightFlank && (!leftFlank || isPunctChar(next));
+      if (canClose && delims && delims.some(d => d.char === '_' && d.active && d.canOpen)) {
+        return { text: full[0], next: end };
+      }
+    }
+  }
+  const em = EMAIL_RE.exec(s.slice(i));
+  if (!em) return null;
+  return { text: em[0], next: i + em[0].length };
+}
 const DOMAIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
-function tryExtAutolink(s, i) {
+// Does the `]` at s[j] close an active `[` label that will form a link?
+// marked skips its bare-URL tokenizer inside a link label, so a bare URL
+// there must not swallow the closing `]` (otherwise tryLink never sees
+// it). Outside a link, a bare URL keeps the `]` (marked's backpedal
+// does not strip it).
+function labelCloseAt(s, j, delims, refs) {
+  let op = null;
+  for (let d = delims.length - 1; d >= 0; d--) {
+    if (delims[d].char === '[' && delims[d].active) { op = delims[d]; break; }
+  }
+  if (!op) return false;
+  const after = s[j + 1];
+  if (after === '(' || after === '[') return true;
+  if (op.pos !== undefined && refs) {
+    const raw = s.slice(op.pos + op.len, j);
+    if (refs[normLabel(raw)]) return true;
+  }
+  return false;
+}
+function tryExtAutolink(s, i, delims, refs) {
   // www. autolink
   if (s.startsWith('www.', i)) {
     const m = DOMAIN_RE.exec(s.slice(i + 4));
     if (m) {
       let end = i + 4 + m[0].length, j = end;
-      while (j < s.length && !isSpace(s[j]) && s[j] !== '<') j++;
+      while (j < s.length && !isSpace(s[j]) && s[j] !== '<') {
+        if (s[j] === ']' && labelCloseAt(s, j, delims, refs)) break;
+        j++;
+      }
       let url = trimAutolinkUrl(s.slice(i, j));
       if (url.length > 4) return { href: 'http://' + url, text: url, next: i + url.length };
     }
@@ -470,7 +519,10 @@ function tryExtAutolink(s, i) {
     if (s.startsWith('://', i + scheme.length - 1 + 1 - 1)) { /* unreachable guard */ }
     if (s.slice(i + scheme.length, i + scheme.length + 2) === '//') {
       let j = i + scheme.length + 2;
-      while (j < s.length && !isSpace(s[j]) && s[j] !== '<') j++;
+      while (j < s.length && !isSpace(s[j]) && s[j] !== '<') {
+        if (s[j] === ']' && labelCloseAt(s, j, delims, refs)) break;
+        j++;
+      }
       let url = trimAutolinkUrl(s.slice(i, j));
       if (url.length > scheme.length + 3) return { href: url, text: url, next: i + url.length };
       return null;
@@ -480,11 +532,9 @@ function tryExtAutolink(s, i) {
     // mailto: does not. Any other scheme is literal text and the email
     // after it is a bare email autolink instead.
     if (scheme === 'xmpp:' || scheme === 'mailto:') {
-      const em = EMAIL_RE.exec(s.slice(i + scheme.length));
+      const em = emailAt(s, i + scheme.length, delims);
       if (em) {
-        let end = i + scheme.length + em[0].length;
-        const after = s[end];
-        if (after === '-' || after === '_' || isAlnum(after)) return null;
+        let end = em.next;
         if (scheme === 'xmpp:' && s[end] === '/') {
           let j = end + 1;
           while (j < s.length && !isSpace(s[j]) && s[j] !== '<' && s[j] !== '/' && s[j] !== '?' && s[j] !== '#') j++;
@@ -500,12 +550,8 @@ function tryExtAutolink(s, i) {
     return null;
   }
   // bare email autolink
-  const em = EMAIL_RE.exec(s.slice(i));
-  if (em) {
-    const after = s[i + em[0].length];
-    if (after === '-' || after === '_' || isAlnum(after)) return null;
-    return { href: 'mailto:' + em[0], text: em[0], next: i + em[0].length };
-  }
+  const em = emailAt(s, i, delims);
+  if (em) return { href: 'mailto:' + em.text, text: em.text, next: em.next };
   return null;
 }
 function plainText(nodes) {
@@ -535,6 +581,10 @@ function flattenExtAuto(list) {
 function inlineParse(s, refs) {
   const nodes = [];
   const delims = []; // {char,node,off,len,canOpen,canClose,active,image}
+  // Fast path: most inline strings contain no bare-URL/email autolink
+  // candidate at all (no www. / :// / @). Skip every per-word autolink
+  // attempt and word-start break when there is nothing to find.
+  const hasAuto = s.includes('www.') || s.includes('://') || s.includes('@');
   function addText(str) {
     if (!str) return;
     const last = nodes[nodes.length - 1];
@@ -552,9 +602,9 @@ function inlineParse(s, refs) {
   while (i < n) {
     const c = s[i];
     // --- extended autolinks (only at a word start) ---
-    if ((c === 'w' || isAlpha(c)) && (i === 0 || isSpace(s[i - 1]) || isPunctChar(s[i - 1]))) {
+    if (hasAuto && (c === 'w' || isAlpha(c)) && (i === 0 || isSpace(s[i - 1]) || isPunctChar(s[i - 1]))) {
       if (c === 'w' || s[i + 1] === ':' || true) {
-        const au = tryExtAutolink(s, i);
+        const au = tryExtAutolink(s, i, delims, refs);
         if (au) { nodes.push({ t: 'link', href: au.href, title: null, children: [{ t: 'text', s: au.text }], auto: 'ext' }); i = au.next; continue; }
       }
     }
@@ -678,7 +728,7 @@ function inlineParse(s, refs) {
     while (j < n) {
       const ch = s[j];
       if (ch === '\\' || ch === '`' || ch === '&' || ch === '<' || ch === '[' || ch === ']' || ch === '*' || ch === '_' || ch === '~' || ch === '\n' || ch === '!') break;
-      if (j > i && (ch === 'w' || isAlpha(ch)) && (isSpace(s[j - 1]) || isPunctChar(s[j - 1]))) break;
+      if (hasAuto && j > i && (ch === 'w' || isAlpha(ch)) && (isSpace(s[j - 1]) || isPunctChar(s[j - 1]))) break;
       j++;
     }
     if (j === i) { addText(c); i++; continue; }
@@ -751,12 +801,16 @@ function tryLink(s, i, nodes, delims, refs) {
       if (!ref) { op.active = false; return null; }
       href = ref.dest; title = ref.title; next = i + 1;
     }
-    // A link's text must not contain another link (images are allowed,
-    // and an image's alt text may contain one as plain text).
+    // A link's text must not contain another (non-autolink) link:
+    // marked discards the outer link when a regular link is emitted
+    // inside its label, but ANGLE autolinks nest inside it, and bare
+    // URLs/emails are tokenized as plain text there (marked skips its
+    // `url` tokenizer while inLink). Images are allowed, and an
+    // image's alt text may contain one as plain text.
     if (!op.image) {
       const hasLink = (list) => {
         for (const nd of list) {
-          if (nd.t === 'link') return true;
+          if (nd.t === 'link' && !nd.auto) return true;
           if (nd.children && hasLink(nd.children)) return true;
         }
         return false;
@@ -786,6 +840,10 @@ function tryLink(s, i, nodes, delims, refs) {
     }
     tnode.s = tnode.s.slice(0, op.off);
     children.push(...nodes.splice(opIdx + 1));
+    // Bare-URL/email autolinks inside the link text are plain text in
+    // marked (its `url` tokenizer is skipped while inLink); angle
+    // autolinks stay nested.
+    flattenExtAuto(children);
     if (tnode.s === '') nodes.splice(opIdx, 1);
     if (op.image) {
       const alt = plainText(children);
@@ -825,6 +883,44 @@ function resolveEmphasis(nodes, delims) {
       }
       if (!found) break;
       const use = closer.char === '~' ? closer.len : (found.len >= 2 && closer.len >= 2 ? 2 : 1);
+      // marked quirk: when this closer is an ambiguous run (can both
+      // open and close) matching an OPENER-LIKE inner opener (preceded
+      // by space/punct, so marked's scan counts it toward the opener's
+      // total), an earlier still-active opener A with (A.len +
+      // closer.len) divisible by 3 and A.len not divisible by 3 has
+      // this closer skipped by marked's rule of 3 — and the inner
+      // opener's length keeps A's count above zero at the next closer,
+      // so A can never match (e.g. `*a **b**c*` leaves the outer `*`
+      // literal while the inner `**` still forms <strong>). Kill such
+      // openers — but only when the next closer after this one is a
+      // plain closer too short to absorb the count; otherwise A may
+      // still match later (cf. cm-411 `*foo**bar**baz*`, where the
+      // inner `**` is ambiguous, not opener-like, and the outer em
+      // DOES form).
+      if (closer.char !== '~' && closer.canOpen && closer.canClose
+        && found.canOpen && !found.canClose) {
+        const fi = delims.indexOf(found);
+        const ci2 = delims.indexOf(closer);
+        let D = null;
+        for (let di = ci2 + 1; di < delims.length; di++) {
+          const dd = delims[di];
+          if (dd.active && dd.char === closer.char && dd.canClose && inNodes(dd)) { D = dd; break; }
+        }
+        if (D && !D.canOpen) {
+          for (let ai = 0; ai < fi; ai++) {
+            const A = delims[ai];
+            if (!A.active || A.char !== closer.char || !A.canOpen || !inNodes(A)) continue;
+            if (A.len % 3 !== 0 && (A.len + closer.len) % 3 === 0) {
+              let sumOpener = 0;
+              for (let xi = ai + 1; xi < ci2; xi++) {
+                const X = delims[xi];
+                if (X.active && X.char === closer.char && X.canOpen && !X.canClose) sumOpener += X.len;
+              }
+              if (D.len < A.len + sumOpener) A.active = false;
+            }
+          }
+        }
+      }
       wrapEmphasis(nodes, found, closer, use, delims);
     }
   }
@@ -1381,6 +1477,15 @@ function parseDoc(lines, refs) {
     }
     // ---- blank line ----
     if (isBlankLine()) {
+      // marked's table-body regex only excludes SPACE-only blank
+      // lines, so a whitespace line containing a tab is swallowed
+      // as an (empty) table row when the open paragraph is a table.
+      const tp0 = tip();
+      if (tp0.t === 'para' && cur.indexOf('\t') >= 0 && isBlankStr(cur)
+        && tp0.lines.length >= 2 && tryTable(tp0.lines)) {
+        tp0.lines.push(cur);
+        continue;
+      }
       if (tip().t === 'para') closeTip();
       // A blank line directly after an HTML block removes the block's
       // trailing newline (marked renders the raw block text up to, but
@@ -1434,8 +1539,14 @@ function parseDoc(lines, refs) {
             // Fall through to the paragraph continuation below.
           }
         }
-        // Interrupting block starts.
-        const act = blockStart(cur, col0, true);
+        // Interrupting block starts. Inside a list item, marked lexes
+        // the item's text with state.top=false, so the paragraph there
+        // is a single line and ANY list marker (any start number)
+        // begins a new block — unlike at top level, where only a list
+        // starting with 1 (or a bullet) interrupts a paragraph.
+        let inItem = false;
+        for (let p = curTip.parent; p; p = p.parent) { if (p.t === 'item') { inItem = true; break; } }
+        const act = blockStart(cur, col0, true, inItem);
         if (!act) {
           // Paragraph continuation.
           let content = cur;
@@ -1472,7 +1583,7 @@ function parseDoc(lines, refs) {
   return doc;
 
   // ---- block-start detection and handling (closures over the loop) ----
-  function blockStart(s, c0, inPara) {
+  function blockStart(s, c0, inPara, inItem) {
     const ind = indentOf(s, c0);
     const rel = ind.col - c0;
     if (rel > 3) {
@@ -1529,7 +1640,7 @@ function parseDoc(lines, refs) {
       if (inPara) {
         const empty = lm.empty;
         if (empty) return null;
-        if (lm.ordered && lm.start !== 1) return null;
+        if (lm.ordered && lm.start !== 1 && !inItem) return null;
       }
       return { kind: 'list', ...lm };
     }
