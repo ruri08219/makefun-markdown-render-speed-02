@@ -839,7 +839,13 @@ function inlineToHtml(src, refs, st, outer) {
   // The emphasis scan works on the masked text (code spans, links and
   // tags masked so their * _ ~ cannot be delimiters); the raw slices
   // come from the original text. Length-preserving, so offsets agree.
-  const masked = maskInlineText(src, refs);
+  // Computed lazily: many paragraphs contain * _ ~ but never attempt an
+  // emphasis token (the run is inside a code span or link).
+  let masked = null;
+  function getMasked() {
+    if (masked === null) masked = maskInlineText(src, refs);
+    return masked;
+  }
   while (i < n) {
     const c = src[i];
     // --- extended autolink at a word start ---
@@ -872,7 +878,7 @@ function inlineToHtml(src, refs, st, outer) {
       continue;
     }
     if (c === "*" || c === "_") {
-      const em = tryEmStrong(src.slice(i), masked, prev, st, refs, bounds);
+      const em = tryEmStrong(src.slice(i), getMasked(), prev, st, refs, bounds);
       if (em) { parts.push(em.html); i += em.raw.length; prev = ""; continue; }
       parts.push(c);
       i++;
@@ -880,7 +886,7 @@ function inlineToHtml(src, refs, st, outer) {
       continue;
     }
     if (c === "~") {
-      const d = tryDel(src.slice(i), masked, prev, st, refs, bounds);
+      const d = tryDel(src.slice(i), getMasked(), prev, st, refs, bounds);
       if (d) { parts.push(d.html); i += d.raw.length; prev = ""; continue; }
       parts.push("~");
       i++; prev = "~";
