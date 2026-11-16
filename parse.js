@@ -867,6 +867,7 @@ function wrapEmphasis(nodes, opener, closer, use, delims) {
   if (cAfter !== '') { cAfterNode = { t: 'text', s: cAfter }; replacement.push(cAfterNode); }
   nodes.splice(oi, ci - oi + 1, ...replacement);
   const oLen = opener.len, cLen = closer.len;
+  const oOff = opener.off, cOff = closer.off;
   opener.len -= use;
   closer.len -= use;
   if (opener.len <= 0) opener.active = false;
@@ -876,17 +877,19 @@ function wrapEmphasis(nodes, opener, closer, use, delims) {
   // Re-point every other delimiter that sat in the split text nodes:
   // the runs they mark now live in the new nodes. (A delimiter's run is
   // non-empty, so the target node always exists when it is needed.)
+  // oOff/cOff are the opener/closer offsets BEFORE the two delimiters
+  // above were re-pointed; the loop must use those, not the mutated ones.
   if (delims) {
     for (const dd of delims) {
       if (dd === opener || dd === closer || !dd.active) continue;
       if (dd.node === onode) {
-        if (dd.off < opener.off) { if (oLeftNode) dd.node = oLeftNode; }
-        else if (oi !== ci && dd.off >= opener.off + oLen) { if (oMidNode) { dd.node = oMidNode; dd.off -= opener.off + oLen; } }
-        else if (oi === ci && dd.off >= opener.off + oLen && dd.off < closer.off) { if (innerNode) { dd.node = innerNode; dd.off -= opener.off + oLen; } }
+        if (dd.off < oOff) { if (oLeftNode) dd.node = oLeftNode; }
+        else if (oi !== ci && dd.off >= oOff + oLen) { if (oMidNode) { dd.node = oMidNode; dd.off -= oOff + oLen; } }
+        else if (oi === ci && dd.off >= oOff + oLen && dd.off < cOff) { if (innerNode) { dd.node = innerNode; dd.off -= oOff + oLen; } }
       }
       if (dd.node === cnode) {
-        if (oi !== ci && dd.off < closer.off) { if (cBeforeNode) dd.node = cBeforeNode; }
-        else if (dd.off >= closer.off + cLen) { if (cAfterNode) { dd.node = cAfterNode; dd.off -= closer.off + cLen; } }
+        if (oi !== ci && dd.off < cOff) { if (cBeforeNode) dd.node = cBeforeNode; }
+        else if (dd.off >= cOff + cLen) { if (cAfterNode) { dd.node = cAfterNode; dd.off -= cOff + use; } }
       }
     }
   }
